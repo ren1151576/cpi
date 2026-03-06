@@ -3,7 +3,12 @@ param(
   [string]$Authorization,   # Accepts full "Bearer xxx" or raw token
 
   [string]$BaseUrl = "http://localhost:8317",
-  [switch]$DryRun
+  [switch]$DryRun,
+  [ValidateRange(1, 128)]
+  [int]$ScanConcurrency = 8,
+  [ValidateRange(1, 300)]
+  [int]$RequestTimeoutSec = 30,
+  [switch]$ShowPerFileResult
 )
 
 if ($Authorization -notmatch '^\s*Bearer\s+') {
@@ -145,7 +150,7 @@ function Resolve-ChatgptAccountId {
 }
 
 try {
-  $resp = Invoke-RestMethod -Method GET -Uri $listUrl -Headers $headers -TimeoutSec 30
+  $resp = Invoke-RestMethod -Method GET -Uri $listUrl -Headers $headers -TimeoutSec $RequestTimeoutSec
 } catch {
   throw "Failed to query auth files: $($_.Exception.Message)"
 }
@@ -167,6 +172,7 @@ if ($files.Count -eq 0) {
 Write-Host "Found $($files.Count) auth files. Verifying validity via /v0/management/api-call ..."
 
 $checkResults = @()
+$apiCheckCandidates = @()
 foreach ($f in $files) {
   if ($null -eq $f) { continue }
 
@@ -201,51 +207,121 @@ foreach ($f in $files) {
     continue
   }
 
-  $payload = @{
+  $apiCheckCandidates += [pscustomobject]@{
+    name      = $name
     authIndex = $authIndex
-    method    = "GET"
-    url       = $usageUrl
-    header    = @{
-      Authorization       = 'Bearer $TOKEN$'
-      "Content-Type"      = "application/json"
-      "User-Agent"        = $codexUserAgent
-      "Chatgpt-Account-Id" = $accountId
+    accountId = $accountId
+  }
+}
+
+if ($apiCheckCandidates.Count -gt 0) {
+  Write-Host "Prepared $($apiCheckCandidates.Count) files for API validation. ScanConcurrency=$ScanConcurrency"
+
+  if ($ScanConcurrency -gt 1 -and $PSVersionTable.PSVersion.Major -ge 7) {
+    $parallelResults = $apiCheckCandidates | ForEach-Object -Parallel {
+      $item = $_
+      $payload = @{
+        authIndex = $item.authIndex
+        method    = "GET"
+        url       = $using:usageUrl
+        header    = @{
+          Authorization        = 'Bearer $TOKEN$'
+          "Content-Type"       = "application/json"
+          "User-Agent"         = $using:codexUserAgent
+          "Chatgpt-Account-Id" = $item.accountId
+        }
+      }
+
+      try {
+        $apiResp = Invoke-RestMethod -Method POST -Uri $using:apiCallUrl -Headers $using:headers -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec $using:RequestTimeoutSec
+        $statusCodeRaw = if ($apiResp -is [System.Collections.IDictionary]) {
+          if ($apiResp.Contains("status_code")) { $apiResp["status_code"] } elseif ($apiResp.Contains("statusCode")) { $apiResp["statusCode"] } else { $null }
+        } else {
+          if ($null -ne $apiResp.PSObject.Properties["status_code"]) { $apiResp.status_code } elseif ($null -ne $apiResp.PSObject.Properties["statusCode"]) { $apiResp.statusCode } else { $null }
+        }
+
+        $statusCode = 0
+        if ($null -ne $statusCodeRaw) {
+          [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
+        }
+        $isValid = ($statusCode -eq 200)
+        $reason = if ($isValid) { "status_code=200" } else { "status_code=$statusCode" }
+
+        [pscustomobject]@{
+          name       = $item.name
+          authIndex  = $item.authIndex
+          statusCode = $statusCode
+          valid      = $isValid
+          reason     = $reason
+        }
+      } catch {
+        [pscustomobject]@{
+          name       = $item.name
+          authIndex  = $item.authIndex
+          statusCode = $null
+          valid      = $false
+          reason     = $_.Exception.Message
+        }
+      }
+    } -ThrottleLimit $ScanConcurrency
+
+    $checkResults += @($parallelResults)
+  } else {
+    if ($ScanConcurrency -gt 1 -and $PSVersionTable.PSVersion.Major -lt 7) {
+      Write-Warning "Parallel scan requires PowerShell 7+. Falling back to sequential scan."
+    }
+
+    foreach ($item in $apiCheckCandidates) {
+      $payload = @{
+        authIndex = $item.authIndex
+        method    = "GET"
+        url       = $usageUrl
+        header    = @{
+          Authorization        = 'Bearer $TOKEN$'
+          "Content-Type"       = "application/json"
+          "User-Agent"         = $codexUserAgent
+          "Chatgpt-Account-Id" = $item.accountId
+        }
+      }
+
+      try {
+        $apiResp = Invoke-RestMethod -Method POST -Uri $apiCallUrl -Headers $headers -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec $RequestTimeoutSec
+        $statusCodeRaw = Get-ObjectPropertyValue -Object $apiResp -Names @("status_code", "statusCode")
+        $statusCode = 0
+        if ($null -ne $statusCodeRaw) {
+          [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
+        }
+        $isValid = ($statusCode -eq 200)
+        $reason = if ($isValid) { "status_code=200" } else { "status_code=$statusCode" }
+
+        $checkResults += [pscustomobject]@{
+          name       = $item.name
+          authIndex  = $item.authIndex
+          statusCode = $statusCode
+          valid      = $isValid
+          reason     = $reason
+        }
+      } catch {
+        $msg = $_.Exception.Message
+        $checkResults += [pscustomobject]@{
+          name       = $item.name
+          authIndex  = $item.authIndex
+          statusCode = $null
+          valid      = $false
+          reason     = $msg
+        }
+      }
     }
   }
+}
 
-  try {
-    $apiResp = Invoke-RestMethod -Method POST -Uri $apiCallUrl -Headers $headers -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec 30
-    $statusCodeRaw = Get-ObjectPropertyValue -Object $apiResp -Names @("status_code", "statusCode")
-    $statusCode = 0
-    if ($null -ne $statusCodeRaw) {
-      [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
-    }
-    $isValid = ($statusCode -eq 200)
-    $reason = if ($isValid) { "status_code=200" } else { "status_code=$statusCode" }
-
-    $checkResults += [pscustomobject]@{
-      name       = $name
-      authIndex  = $authIndex
-      statusCode = $statusCode
-      valid      = $isValid
-      reason     = $reason
-    }
-
-    if ($isValid) {
-      Write-Host "[VALID] $name -> status_code=200"
+if ($ShowPerFileResult) {
+  foreach ($result in $checkResults) {
+    if ($result.valid) {
+      Write-Host "[VALID] $($result.name) -> $($result.reason)"
     } else {
-      Write-Warning "[INVALID] $name -> status_code=$statusCode"
+      Write-Warning "[INVALID] $($result.name) -> $($result.reason)"
     }
-  } catch {
-    $msg = $_.Exception.Message
-    $checkResults += [pscustomobject]@{
-      name       = $name
-      authIndex  = $authIndex
-      statusCode = $null
-      valid      = $false
-      reason     = $msg
-    }
-    Write-Warning "[INVALID] $name -> api-call failed: $msg"
   }
 }
 
@@ -277,7 +353,7 @@ foreach ($f in $targets) {
   $deleteUrl = "$BaseUrl/v0/management/auth-files?name=$encodedName"
 
   try {
-    Invoke-RestMethod -Method DELETE -Uri $deleteUrl -Headers $headers -TimeoutSec 30 | Out-Null
+    Invoke-RestMethod -Method DELETE -Uri $deleteUrl -Headers $headers -TimeoutSec $RequestTimeoutSec | Out-Null
     $success++
     Write-Host "[OK] $name"
   } catch {
