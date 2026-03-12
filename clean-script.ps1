@@ -149,6 +149,74 @@ function Resolve-ChatgptAccountId {
   return $null
 }
 
+function Invoke-ApiValidationRequest
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Item,
+        [Parameter(Mandatory = $true)]
+        [string]$ApiCallUrl,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Headers,
+        [Parameter(Mandatory = $true)]
+        [string]$UsageUrl,
+        [Parameter(Mandatory = $true)]
+        [string]$CodexUserAgent,
+        [Parameter(Mandatory = $true)]
+        [int]$RequestTimeoutSec
+    )
+
+    $payload = @{
+        authIndex = $Item.authIndex
+        method = "GET"
+        url = $UsageUrl
+        header = @{
+            Authorization = 'Bearer $TOKEN$'
+            "Content-Type" = "application/json"
+            "User-Agent" = $CodexUserAgent
+            "Chatgpt-Account-Id" = $Item.accountId
+        }
+    }
+
+    try
+    {
+        $apiResp = Invoke-RestMethod -Method POST -Uri $ApiCallUrl -Headers $Headers -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec $RequestTimeoutSec
+        $statusCodeRaw = Get-ObjectPropertyValue -Object $apiResp -Names @("status_code", "statusCode")
+        $statusCode = 0
+        if ($null -ne $statusCodeRaw)
+        {
+            [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
+        }
+        $isValid = ($statusCode -eq 200)
+        $reason = if ($isValid)
+        {
+            "status_code=200"
+        }
+        else
+        {
+            "status_code=$statusCode"
+        }
+
+        return [pscustomobject]@{
+            name = $Item.name
+            authIndex = $Item.authIndex
+            statusCode = $statusCode
+            valid = $isValid
+            reason = $reason
+        }
+    }
+    catch
+    {
+        return [pscustomobject]@{
+            name = $Item.name
+            authIndex = $Item.authIndex
+            statusCode = $null
+            valid = $false
+            reason = $_.Exception.Message
+        }
+    }
+}
+
 try {
   $resp = Invoke-RestMethod -Method GET -Uri $listUrl -Headers $headers -TimeoutSec $RequestTimeoutSec
 } catch {
@@ -216,6 +284,8 @@ foreach ($f in $files) {
 
 if ($apiCheckCandidates.Count -gt 0) {
   Write-Host "Prepared $($apiCheckCandidates.Count) files for API validation. ScanConcurrency=$ScanConcurrency"
+  $validatedCount = 0
+  $validatedTotal = $apiCheckCandidates.Count
 
   if ($ScanConcurrency -gt 1 -and $PSVersionTable.PSVersion.Major -ge 7) {
     $parallelResults = $apiCheckCandidates | ForEach-Object -Parallel {
@@ -266,51 +336,172 @@ if ($apiCheckCandidates.Count -gt 0) {
     } -ThrottleLimit $ScanConcurrency
 
     $checkResults += @($parallelResults)
-  } else {
-    if ($ScanConcurrency -gt 1 -and $PSVersionTable.PSVersion.Major -lt 7) {
-      Write-Warning "Parallel scan requires PowerShell 7+. Falling back to sequential scan."
+    $validatedCount = $validatedTotal
+    Write-Host "Validation progress: $validatedCount/$validatedTotal"
+  }
+  elseif ($ScanConcurrency -gt 1 -and (Get-Command Start-Job -ErrorAction SilentlyContinue))
+  {
+      Write-Host "PowerShell $( $PSVersionTable.PSVersion ) detected. Using Start-Job parallel scan."
+
+      $pendingQueue = [System.Collections.Queue]::new()
+      foreach ($candidate in $apiCheckCandidates)
+      {
+          $pendingQueue.Enqueue($candidate)
     }
 
-    foreach ($item in $apiCheckCandidates) {
-      $payload = @{
-        authIndex = $item.authIndex
-        method    = "GET"
-        url       = $usageUrl
-        header    = @{
-          Authorization        = 'Bearer $TOKEN$'
-          "Content-Type"       = "application/json"
-          "User-Agent"         = $codexUserAgent
-          "Chatgpt-Account-Id" = $item.accountId
+      $runningJobs = @()
+
+      while ($pendingQueue.Count -gt 0 -or $runningJobs.Count -gt 0)
+      {
+          while ($pendingQueue.Count -gt 0 -and $runningJobs.Count -lt $ScanConcurrency)
+          {
+              $item = $pendingQueue.Dequeue()
+              $job = Start-Job -ScriptBlock {
+                  param($InputItem, $InputApiCallUrl, $InputHeaders, $InputUsageUrl, $InputCodexUserAgent, $InputRequestTimeoutSec)
+                  $payload = @{
+                      authIndex = $InputItem.authIndex
+                      method = "GET"
+                      url = $InputUsageUrl
+                      header = @{
+                          Authorization = 'Bearer $TOKEN$'
+                          "Content-Type" = "application/json"
+                          "User-Agent" = $InputCodexUserAgent
+                          "Chatgpt-Account-Id" = $InputItem.accountId
+                      }
+                  }
+
+                  try
+                  {
+                      $apiResp = Invoke-RestMethod -Method POST -Uri $InputApiCallUrl -Headers $InputHeaders -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec $InputRequestTimeoutSec
+                      $statusCodeRaw = if ($apiResp -is [System.Collections.IDictionary])
+                      {
+                          if ( $apiResp.Contains("status_code"))
+                          {
+                              $apiResp["status_code"]
+                          }
+                          elseif ($apiResp.Contains("statusCode"))
+                          {
+                              $apiResp["statusCode"]
+                          }
+                          else
+                          {
+                              $null
+                          }
+                      }
+                      else
+                      {
+                          if ($null -ne $apiResp.PSObject.Properties["status_code"])
+                          {
+                              $apiResp.status_code
+                          }
+                          elseif ($null -ne $apiResp.PSObject.Properties["statusCode"])
+                          {
+                              $apiResp.statusCode
+                          }
+                          else
+                          {
+                              $null
+                          }
+                      }
+
+                      $statusCode = 0
+                      if ($null -ne $statusCodeRaw)
+                      {
+                          [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
+                      }
+                      $isValid = ($statusCode -eq 200)
+                      $reason = if ($isValid)
+                      {
+                          "status_code=200"
+                      }
+                      else
+                      {
+                          "status_code=$statusCode"
+                      }
+
+                      [pscustomobject]@{
+                          name = $InputItem.name
+                          authIndex = $InputItem.authIndex
+                          statusCode = $statusCode
+                          valid = $isValid
+                          reason = $reason
+                      }
+                  }
+                  catch
+                  {
+                      [pscustomobject]@{
+                          name = $InputItem.name
+                          authIndex = $InputItem.authIndex
+                          statusCode = $null
+                          valid = $false
+                          reason = $_.Exception.Message
+                      }
+                  }
+              } -ArgumentList $item, $apiCallUrl, $headers, $usageUrl, $codexUserAgent, $RequestTimeoutSec
+
+              $runningJobs += $job
+          }
+
+          $finishedJob = Wait-Job -Job $runningJobs -Any -Timeout 1
+          if ($null -eq $finishedJob)
+          {
+              continue
+          }
+
+          $completedJobs = @($runningJobs | Where-Object { $_.State -in @("Completed", "Failed", "Stopped") })
+          foreach ($job in $completedJobs)
+          {
+              try
+              {
+                  $jobOutput = Receive-Job -Job $job -ErrorAction Stop
+                  if ($null -ne $jobOutput)
+                  {
+                      $checkResults += @($jobOutput)
+                  }
+                  else
+                  {
+                      $checkResults += [pscustomobject]@{
+                          name = "<unknown>"
+                          authIndex = $null
+                          statusCode = $null
+                          valid = $false
+                          reason = "job returned no output"
+                      }
+                  }
+              }
+              catch
+              {
+                  $checkResults += [pscustomobject]@{
+                      name = "<unknown>"
+                      authIndex = $null
+                      statusCode = $null
+                      valid = $false
+                      reason = "job failed: $( $_.Exception.Message )"
+                  }
+              }
+              finally
+              {
+                  Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                  $runningJobs = @($runningJobs | Where-Object { $_.Id -ne $job.Id })
+                  $validatedCount++
         }
       }
 
-      try {
-        $apiResp = Invoke-RestMethod -Method POST -Uri $apiCallUrl -Headers $headers -Body ($payload | ConvertTo-Json -Depth 20) -ContentType "application/json" -TimeoutSec $RequestTimeoutSec
-        $statusCodeRaw = Get-ObjectPropertyValue -Object $apiResp -Names @("status_code", "statusCode")
-        $statusCode = 0
-        if ($null -ne $statusCodeRaw) {
-          [void][int]::TryParse(([string]$statusCodeRaw), [ref]$statusCode)
-        }
-        $isValid = ($statusCode -eq 200)
-        $reason = if ($isValid) { "status_code=200" } else { "status_code=$statusCode" }
-
-        $checkResults += [pscustomobject]@{
-          name       = $item.name
-          authIndex  = $item.authIndex
-          statusCode = $statusCode
-          valid      = $isValid
-          reason     = $reason
-        }
-      } catch {
-        $msg = $_.Exception.Message
-        $checkResults += [pscustomobject]@{
-          name       = $item.name
-          authIndex  = $item.authIndex
-          statusCode = $null
-          valid      = $false
-          reason     = $msg
-        }
+          Write-Host "Validation progress: $validatedCount/$validatedTotal"
       }
+  }
+  else
+  {
+      if ($ScanConcurrency -gt 1 -and $PSVersionTable.PSVersion.Major -lt 7)
+      {
+          Write-Warning "Parallel scan requires PowerShell 7+ or Start-Job. Falling back to sequential scan."
+      }
+
+      foreach ($item in $apiCheckCandidates)
+      {
+          $checkResults += Invoke-ApiValidationRequest -Item $item -ApiCallUrl $apiCallUrl -Headers $headers -UsageUrl $usageUrl -CodexUserAgent $codexUserAgent -RequestTimeoutSec $RequestTimeoutSec
+          $validatedCount++
+          Write-Host "Validation progress: $validatedCount/$validatedTotal"
     }
   }
 }
